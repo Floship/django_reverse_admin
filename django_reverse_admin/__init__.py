@@ -12,6 +12,9 @@ from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext as _
 from django.core.exceptions import PermissionDenied
 
+from nested_admin.nested import NestedModelAdminMixin
+
+
 class ReverseInlineFormSet(BaseModelFormSet):
     '''
     A formset with either a single object or a single empty
@@ -233,3 +236,10 @@ class ReverseModelAdmin(ModelAdmin):
         }
         context.update(extra_context or {})
         return self.render_change_form(request, context, form_url=form_url, add=True)
+
+
+class NestedReverseModelAdmin(NestedModelAdminMixin, ReverseModelAdmin):
+    """
+    Reverse model admin with nested inlines feature
+    """
+    pass
