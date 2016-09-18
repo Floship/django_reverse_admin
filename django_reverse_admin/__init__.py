@@ -1,18 +1,27 @@
-#pylint: skip-file
+from django.core.exceptions import PermissionDenied
 from django.contrib.admin import helpers, ModelAdmin
 from django.contrib.admin.options import InlineModelAdmin
-from django.db import models
+from django.contrib.admin.exceptions import DisallowedModelAdminToField
+from django.contrib.admin.utils import unquote
+from django.db import transaction
 from django.db.models import OneToOneField, ForeignKey
 from django.forms import ModelForm
 from django.forms.formsets import all_valid
 from django.forms.models import BaseModelFormSet, modelformset_factory
 from django.utils.encoding import force_text
 from django.utils.functional import curry
-from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext as _
-from django.core.exceptions import PermissionDenied
+from django.utils.decorators import method_decorator
+from django.utils.html import escape
+from django.views.decorators.csrf import csrf_protect
+from django.http import Http404
 
 from nested_admin.nested import NestedModelAdminMixin
+
+
+csrf_protect_m = method_decorator(csrf_protect)
+TO_FIELD_VAR = '_to_field'
+IS_POPUP_VAR = '_popup'
 
 
 class ReverseInlineFormSet(BaseModelFormSet):
@@ -23,6 +32,7 @@ class ReverseInlineFormSet(BaseModelFormSet):
     '''
     model = None
     parent_fk_name = ''
+
     def __init__(self,
                  data=None,
                  files=None,
@@ -30,7 +40,8 @@ class ReverseInlineFormSet(BaseModelFormSet):
                  prefix=None,
                  queryset=None,
                  save_as_new=False):
-        object = getattr(instance, self.parent_fk_name)
+
+        object = getattr(instance, self.parent_fk_name, None)
         if object:
             qs = self.model.objects.filter(pk=object.id)
         else:
@@ -41,6 +52,7 @@ class ReverseInlineFormSet(BaseModelFormSet):
                                                    queryset=qs)
         for form in self.forms:
             form.empty_permitted = False
+
 
 def reverse_inlineformset_factory(parent_model,
                                   model,
@@ -64,11 +76,13 @@ def reverse_inlineformset_factory(parent_model,
     FormSet.parent_fk_name = parent_fk_name
     return FormSet
 
+
 class ReverseInlineModelAdmin(InlineModelAdmin):
     '''
     Use the name and the help_text of the owning models field to
     render the verbose_name and verbose_name_plural texts.
     '''
+
     def __init__(self,
                  parent_model,
                  parent_fk_name,
@@ -100,7 +114,8 @@ class ReverseInlineModelAdmin(InlineModelAdmin):
             "form": self.form,
             "fields": fields,
             "exclude": exclude,
-            "formfield_callback": curry(self.formfield_for_dbfield, request=request),
+            "formfield_callback": curry(self.formfield_for_dbfield,
+                                        request=request),
         }
         defaults.update(kwargs)
         return reverse_inlineformset_factory(self.parent_model,
@@ -108,12 +123,14 @@ class ReverseInlineModelAdmin(InlineModelAdmin):
                                              self.parent_fk_name,
                                              **defaults)
 
+
 class ReverseModelAdmin(ModelAdmin):
     '''
     Patched ModelAdmin class. The add_view method is overridden to
     allow the reverse inline formsets to be saved before the parent
     model.
     '''
+
     def __init__(self, model, admin_site):
 
         super(ReverseModelAdmin, self).__init__(model, admin_site)
@@ -144,98 +161,137 @@ class ReverseModelAdmin(ModelAdmin):
         self.tmp_inline_instances = inline_instances
 
     def get_inline_instances(self, request, obj=None):
-        return self.tmp_inline_instances + super(ReverseModelAdmin, self).get_inline_instances(request, obj)
+        return self.tmp_inline_instances + super(
+            ReverseModelAdmin, self).get_inline_instances(request, obj)
 
-    def change_view(self, request, object_id, form_url='', extra_context=None):
-        return self.changeform_view(request, object_id, form_url, extra_context)
+    @csrf_protect_m
+    @transaction.atomic
+    def changeform_view(self, request, object_id=None, form_url='',
+                        extra_context=None):
 
-    def add_view(self, request, form_url='', extra_context=None):
-        "The 'add' admin view for this model."
+        to_field = request.POST.get(TO_FIELD_VAR,
+                                    request.GET.get(TO_FIELD_VAR))
+        if to_field and not self.to_field_allowed(request, to_field):
+            raise DisallowedModelAdminToField(
+                "The field %s cannot be referenced." % to_field)
+
         model = self.model
         opts = model._meta
-        if not self.has_add_permission(request):
-            raise PermissionDenied
 
-        model_form = self.get_form(request)
-        formsets = []
+        if request.method == 'POST' and '_saveasnew' in request.POST:
+            object_id = None
+
+        add = object_id is None
+
+        if add:
+            if not self.has_add_permission(request):
+                raise PermissionDenied
+            obj = None
+
+        else:
+            obj = self.get_object(request, unquote(object_id), to_field)
+
+            if not self.has_change_permission(request, obj):
+                raise PermissionDenied
+
+            if obj is None:
+                raise Http404(
+                    _('%(name)s object with primary key %(key)r does not exist.') % 
+                    {
+                        'name': force_text(opts.verbose_name),
+                        'key': escape(object_id)
+                    })
+
+        ModelForm = self.get_form(request, obj)
         if request.method == 'POST':
-            form = model_form(request.POST, request.FILES)
+            form = ModelForm(request.POST, request.FILES, instance=obj)
             if form.is_valid():
                 form_validated = True
-                new_object = self.save_form(request, form, change=False)
+                new_object = self.save_form(request, form, change=not add)
             else:
                 form_validated = False
-                new_object = self.model()
-            prefixes = {}
-            for FormSet, inline in self.get_formsets_with_inlines(request):
-                prefix = FormSet.get_default_prefix()
-                prefixes[prefix] = prefixes.get(prefix, 0) + 1
-                if prefixes[prefix] != 1:
-                    prefix = "%s-%s" % (prefix, prefixes[prefix])
-                formset = FormSet(data=request.POST, files=request.FILES,
-                                  instance=new_object,
-                                  save_as_new=request.POST.has_key("_saveasnew"),
-                                  prefix=prefix)
-                formsets.append(formset)
+                new_object = form.instance
+            formsets, inline_instances = self._create_formsets(
+                request, new_object, change=not add)
             if all_valid(formsets) and form_validated:
-                # Here is the modified code.
-                for formset, inline in zip(formsets, self.get_inline_instances(request)):
+                # start mod. code
+                for formset, inline in zip(formsets,
+                                           self.get_inline_instances(request)):
                     if not isinstance(inline, ReverseInlineModelAdmin):
                         continue
-                    obj = formset.save()[0]
-                    setattr(new_object, inline.parent_fk_name, obj)
-                self.save_model(request, new_object, form, change=False)
-                form.save_m2m()
-                for formset in formsets:
-                    self.save_formset(request, form, formset, change=False)
-
-                #self.log_addition(request, new_object)
-                return self.response_add(request, new_object)
+                    try:
+                        obj = formset.save()[0]
+                        setattr(new_object, inline.parent_fk_name, obj)
+                    except IndexError:
+                        continue
+                # end mod. code
+                self.save_model(request, new_object, form, not add)
+                self.save_related(request, form, formsets, not add)
+                change_message = self.construct_change_message(request,
+                                                               form,
+                                                               formsets,
+                                                               add)
+                if add:
+                    self.log_addition(request, new_object, change_message)
+                    return self.response_add(request, new_object)
+                else:
+                    self.log_change(request, new_object, change_message)
+                    return self.response_change(request, new_object)
+            else:
+                form_validated = False
         else:
-            # Prepare the dict of initial data from the request.
-            # We have to special-case M2Ms as a list of comma-separated PKs.
-            initial = dict(request.GET.items())
-            for k in initial:
-                try:
-                    f = opts.get_field(k)
-                except models.FieldDoesNotExist:
-                    continue
-                if isinstance(f, models.ManyToManyField):
-                    initial[k] = initial[k].split(",")
-            form = model_form(initial=initial)
-            prefixes = {}
-            for FormSet, inline in self.get_formsets_with_inlines(request):
-                prefix = FormSet.get_default_prefix()
-                prefixes[prefix] = prefixes.get(prefix, 0) + 1
-                if prefixes[prefix] != 1:
-                    prefix = "%s-%s" % (prefix, prefixes[prefix])
-                formset = FormSet(instance=self.model(), prefix=prefix)
-                formsets.append(formset)
+            if add:
+                initial = self.get_changeform_initial_data(request)
+                form = ModelForm(initial=initial)
+                formsets, inline_instances = self._create_formsets(
+                    request, form.instance, change=False)
+            else:
+                form = ModelForm(instance=obj)
+                formsets, inline_instances = self._create_formsets(
+                    request, obj, change=True)
 
-        adminForm = helpers.AdminForm(form, list(self.get_fieldsets(request)), self.prepopulated_fields)
+        adminForm = helpers.AdminForm(
+            form,
+            list(self.get_fieldsets(request, obj)),
+            self.get_prepopulated_fields(request, obj),
+            self.get_readonly_fields(request, obj),
+            model_admin=self)
         media = self.media + adminForm.media
 
-        inline_admin_formsets = []
-        for inline, formset in zip(self.get_inline_instances(request), formsets):
-            fieldsets = list(inline.get_fieldsets(request))
-            inline_admin_formset = helpers.InlineAdminFormSet(inline, formset, fieldsets)
-            inline_admin_formsets.append(inline_admin_formset)
-            media = media + inline_admin_formset.media
+        inline_formsets = self.get_inline_formsets(request,
+                                                   formsets,
+                                                   inline_instances,
+                                                   obj)
+        for inline_formset in inline_formsets:
+            media = media + inline_formset.media
 
-        context = {
-            'title': _('Add %s') % force_text(opts.verbose_name),
-            'adminform': adminForm,
-            #'is_popup': request.REQUEST.has_key('_popup'),
-            'is_popup': False,
-            'show_delete': False,
-            'media': mark_safe(media),
-            'inline_admin_formsets': inline_admin_formsets,
-            'errors': helpers.AdminErrorList(form, formsets),
-            #'root_path': self.admin_site.root_path,
-            'app_label': opts.app_label,
-        }
+        context = dict(self.admin_site.each_context(request),
+            title=(_('Add %s') if add else _('Change %s')) % force_text(opts.verbose_name),
+            adminform=adminForm,
+            object_id=object_id,
+            original=obj,
+            is_popup=(IS_POPUP_VAR in request.POST or
+                      IS_POPUP_VAR in request.GET),
+            to_field=to_field,
+            media=media,
+            inline_admin_formsets=inline_formsets,
+            errors=helpers.AdminErrorList(form, formsets),
+            preserved_filters=self.get_preserved_filters(request),
+        )
+
+        # Hide the "Save" and "Save and continue" buttons if "Save as New" was
+        # previously chosen to prevent the interface from getting confusing.
+        if request.method == 'POST' and not form_validated and "_saveasnew" in request.POST:
+            context['show_save'] = False
+            context['show_save_and_continue'] = False
+            # Use the change template instead of the add template.
+            add = False
+
         context.update(extra_context or {})
-        return self.render_change_form(request, context, form_url=form_url, add=True)
+
+        return self.render_change_form(request, context, add=add,
+                                       change=not add, obj=obj,
+                                       form_url=form_url)
 
 
 class NestedReverseModelAdmin(NestedModelAdminMixin, ReverseModelAdmin):
